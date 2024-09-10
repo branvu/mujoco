@@ -204,6 +204,70 @@ _RAY_FUNC = {
     GeomType.MESH: _ray_mesh,
 }
 
+def ray_batch(
+    m: Model,
+    geom_xmat: jax.Array,  # num_geoms, 3, 3
+    geom_xpos: jax.Array,  # num_geoms, 3
+    pnt: jax.Array,
+    vec: jax.Array,
+    geomgroup: Sequence[int] = (),
+    flg_static: bool = True,
+    bodyexclude: int = -1,
+) -> Tuple[jax.Array, jax.Array]:
+  """Returns the geom id and distance at which a ray intersects with a geom.
+
+  Args:
+    m: MJX model
+    geom_xmat: xmat matrix
+    geom_xpos: xpos matrix
+    pnt: ray origin point (3,)
+    vec: ray direction    (3,)
+    geomgroup: group inclusion/exclusion mask, or empty to ignore
+    flg_static: if True, allows rays to intersect with static geoms
+    bodyexclude: ignore geoms on specified body id
+
+  Returns:
+    dist: distance from ray origin to geom surface (or -1.0 for no intersection)
+    id: id of intersected geom (or -1 for no intersection)
+  """
+  dists, ids = [], []
+  geom_filter = m.geom_bodyid != bodyexclude
+  geom_filter &= (m.geom_matid != -1) | (m.geom_rgba[:, 3] != 0)
+  geom_filter &= (m.geom_matid == -1) | (m.mat_rgba[m.geom_matid, 3] != 0)
+  geom_filter &= flg_static | (m.body_weldid[m.geom_bodyid] != 0)
+  if geomgroup:
+    geomgroup = np.array(geomgroup, dtype=bool)
+    geom_filter &= geomgroup[np.clip(m.geom_group, 0, mujoco.mjNGROUP)]
+
+  # map ray to local geom frames
+  geom_pnts = jax.vmap(lambda x, y: x.T @ (pnt - y))(geom_xmat, geom_xpos)
+  geom_vecs = jax.vmap(lambda x: x.T @ vec)(geom_xmat)
+
+  for geom_type, fn in _RAY_FUNC.items():
+    id_, = np.nonzero(geom_filter & (m.geom_type == geom_type))
+
+    if id_.size == 0:
+      continue
+
+    args = m.geom_size[id_], geom_pnts[id_], geom_vecs[id_]
+
+    if geom_type == GeomType.MESH:
+      dist, id_ = fn(m, id_, *args)
+    else:
+      dist = jax.vmap(fn)(*args)
+
+    dists, ids = dists + [dist], ids + [id_]
+
+  if not ids:
+    return jp.array(-1), jp.array(-1.0)
+
+  dists = jp.concatenate(dists)
+  ids = jp.concatenate(ids)
+  min_id = jp.argmin(dists)
+  dist = jp.where(jp.isinf(dists[min_id]), -1, dists[min_id])
+  id_ = jp.where(jp.isinf(dists[min_id]), -1, ids[min_id])
+
+  return dist, id_
 
 def ray(
     m: Model,
@@ -229,7 +293,6 @@ def ray(
     dist: distance from ray origin to geom surface (or -1.0 for no intersection)
     id: id of intersected geom (or -1 for no intersection)
   """
-
   dists, ids = [], []
   geom_filter = m.geom_bodyid != bodyexclude
   geom_filter &= (m.geom_matid != -1) | (m.geom_rgba[:, 3] != 0)
@@ -268,3 +331,41 @@ def ray(
   id_ = jp.where(jp.isinf(dists[min_id]), -1, ids[min_id])
 
   return dist, id_
+  # dists, ids = [], []
+  # geom_filter = m.geom_bodyid != bodyexclude
+  # geom_filter &= (m.geom_matid != -1) | (m.geom_rgba[:, 3] != 0)
+  # geom_filter &= (m.geom_matid == -1) | (m.mat_rgba[m.geom_matid, 3] != 0)
+  # geom_filter &= flg_static | (m.body_weldid[m.geom_bodyid] != 0)
+  # if geomgroup:
+  #   geomgroup = np.array(geomgroup, dtype=bool)
+  #   geom_filter &= geomgroup[np.clip(m.geom_group, 0, mujoco.mjNGROUP)]
+
+  # # map ray to local geom frames
+  # geom_pnts = jax.vmap(lambda x, y: x.T @ (pnt - y))(d.geom_xmat, d.geom_xpos)
+  # geom_vecs = jax.vmap(lambda x: x.T @ vec)(d.geom_xmat)
+
+  # for geom_type, fn in _RAY_FUNC.items():
+  #   id_, = np.nonzero(geom_filter & (m.geom_type == geom_type))
+
+  #   if id_.size == 0:
+  #     continue
+
+  #   args = m.geom_size[id_], geom_pnts[id_], geom_vecs[id_]
+
+  #   if geom_type == GeomType.MESH:
+  #     dist, id_ = fn(m, id_, *args)
+  #   else:
+  #     dist = jax.vmap(fn)(*args)
+
+  #   dists, ids = dists + [dist], ids + [id_]
+
+  # if not ids:
+  #   return jp.array(-1), jp.array(-1.0)
+
+  # dists = jp.concatenate(dists)
+  # ids = jp.concatenate(ids)
+  # min_id = jp.argmin(dists)
+  # dist = jp.where(jp.isinf(dists[min_id]), -1, dists[min_id])
+  # id_ = jp.where(jp.isinf(dists[min_id]), -1, ids[min_id])
+
+  # return dist, id_

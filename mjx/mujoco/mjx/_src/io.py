@@ -328,6 +328,11 @@ def _get_contact(c: mujoco._structs._MjContactList, cx: types.Contact):
       value = value.reshape((-1, 9))
     getattr(c, field.name)[:] = value
 
+def get_data_idx(m, d, idx):
+  assert len(d.qpos.shape) > 1
+  result = mujoco.MjData(m)
+  get_data_into_idx(result, m, d, idx)
+  return result
 
 def get_data(
     m: mujoco.MjModel, d: types.Data
@@ -345,6 +350,57 @@ def get_data(
 
   return result
 
+def get_data_into_idx(
+    result: Union[mujoco.MjData, List[mujoco.MjData]],
+    m: mujoco.MjModel,
+    d: types.Data,
+    batch_index: int
+):
+  """Gets mjx.Data from a device into an existing mujoco.MjData at a specific batch index."""
+
+  d = jax.device_get(d)
+
+  d_i = jax.tree_util.tree_map(lambda x: x[batch_index], d)
+  result_i = result
+  ncon = (d_i.contact.dist <= 0).sum()
+  efc_active = (d_i.efc_J != 0).any(axis=1)
+  nefc = int(efc_active.sum())
+  result_i.nnzJ = nefc * m.nv
+  if ncon != result_i.ncon or nefc != result_i.nefc:
+    mujoco._functions._realloc_con_efc(result_i, ncon=ncon, nefc=nefc)  # pylint: disable=protected-access
+  result_i.efc_J_rownnz[:] = np.repeat(m.nv, nefc)
+  result_i.efc_J_rowadr[:] = np.arange(0, nefc * m.nv, m.nv)
+  result_i.efc_J_colind[:] = np.tile(np.arange(m.nv), nefc)
+
+  for field in types.Data.fields():
+    if field.name == 'contact':
+      _get_contact(result_i.contact, d_i.contact)
+      # efc_address must be updated because rows were deleted above:
+      efc_map = np.cumsum(efc_active) - 1
+      result_i.contact.efc_address[:] = efc_map[result_i.contact.efc_address]
+      continue
+
+    value = getattr(d_i, field.name)
+
+    if field.name in ('nefc', 'ncon'):
+      value = {'nefc': nefc, 'ncon': ncon}[field.name]
+    elif field.name.endswith('xmat') or field.name == 'ximat':
+      value = value.reshape((-1, 9))
+    elif field.name.startswith('efc_'):
+      value = value[efc_active]
+      if field.name == 'efc_J':
+        value = value.reshape(-1)
+    elif field.name == 'qM' and not support.is_sparse(m):
+      value = value[dof_i, dof_j]
+    elif field.name == 'qLD' and not support.is_sparse(m):
+      value = value[dof_i, dof_j]
+    elif field.name == 'qLDiagInv' and not support.is_sparse(m):
+      value = np.ones(m.nv)
+
+    if isinstance(value, np.ndarray) and value.shape:
+      getattr(result_i, field.name)[:] = value
+    else:
+      setattr(result_i, field.name, value)
 
 def get_data_into(
     result: Union[mujoco.MjData, List[mujoco.MjData]],
